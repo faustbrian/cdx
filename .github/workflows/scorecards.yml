@@ -1,0 +1,36 @@
+name: Scorecards
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "25 4 * * 1"
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  scorecards:
+    name: OSSF Scorecards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@0864cf19026789058feabb7e87baa5f140aac736
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@130b0aba42a167fa1aa71af5d21afdf1fdd4f7f5
+        with:
+          sarif_file: results.sarif

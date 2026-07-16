@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Release Binary (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            archive: cdx-linux-x86_64.tar.gz
+            binary: cdx
+          - platform: macos-arm64
+            runner: macos-15
+            archive: cdx-macos-arm64.tar.gz
+            binary: cdx
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Build release binary
+        run: cargo build --release --locked --all-features
+
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/release/${{ matrix.binary }} dist/
+          cp README.md LICENSE.md CHANGELOG.md dist/
+          tar -C dist -czf ${{ matrix.archive }} .
+
+      - name: Publish archive
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+        with:
+          files: ${{ matrix.archive }}
