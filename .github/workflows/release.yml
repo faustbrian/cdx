@@ -26,7 +26,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
@@ -42,6 +42,6 @@ jobs:
           tar -C dist -czf ${{ matrix.archive }} .
 
       - name: Publish archive
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           files: ${{ matrix.archive }}
