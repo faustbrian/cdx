@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  host-dependency-audit:
+    name: Host Dependency Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Exercise policy audit regressions
+        run: ./scripts/test-policy-audits.sh
+
+      - name: Reject host runtime regressions
+        run: ./scripts/audit-host-dependencies.sh
+
+      - name: Enforce Dependabot and dependency review policy
+        run: ./scripts/audit-dependency-policy.sh
+
+      - name: Enforce published verification docs policy
+        run: ./scripts/audit-docs-policy.sh
+
+      - name: Enforce MIT license contract
+        run: ./scripts/audit-license-policy.sh
+
+      - name: Verify publishable package contents
+        run: ./scripts/audit-package.sh
+
+      - name: Enforce README badge contract
+        run: ./scripts/audit-readme-badges.sh
+
+      - name: Enforce release workflow contract
+        run: ./scripts/audit-release-workflow.sh
+
+      - name: Enforce workflow metadata policy
+        run: ./scripts/audit-workflow-metadata.sh
+
+      - name: Reject mutable workflow action references
+        run: ./scripts/audit-workflow-actions.sh
+
+      - name: Reject disabled compiler and Clippy diagnostics
+        run: ./scripts/audit-lint-policy.sh
+
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain with rustfmt
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: rustfmt
+
+      - name: Verify formatting
+        run: cargo fmt --check --all
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain with clippy
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          components: clippy
+
+      - name: Run strict clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Reject disabled compiler and Clippy diagnostics
+        run: ./scripts/audit-lint-policy.sh
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features
+
+      - name: Build release binary
+        run: cargo build --release --locked --all-features
+
+  workflow-actions:
+    name: Workflow Action Pin Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Reject mutable workflow action references
+        run: ./scripts/audit-workflow-actions.sh
+
+  supply-chain:
+    name: Dependency Security and Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Install pinned audit tools
+        run: |
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-deny --locked --version 0.20.2
+
+      - name: Audit advisories
+        run: ./scripts/audit-supply-chain.sh
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Install pinned coverage tool
+        run: cargo install cargo-llvm-cov --locked --version 0.8.7
+
+      - name: Enforce measured coverage thresholds
+        run: ./scripts/audit-coverage.sh
+
+      - name: Verify README coverage snapshot
+        run: ./scripts/audit-readme-coverage.sh
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: coverage-report
+          path: |
+            target/coverage-summary.json
+            target/coverage-summary.txt
+            target/lcov.info
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Package Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+
+      - name: Verify publishable package contents
+        run: ./scripts/audit-package.sh
+
+      - name: Verify release archive contents and checksum
+        run: ./scripts/audit-release-archive.sh
