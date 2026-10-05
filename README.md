@@ -32,7 +32,8 @@ command.
   focused on user-visible threads, with an explicit opt-in when needed.
 - Policy audit scripts are self-tested so CI proves mutable workflow pins and
   weakened lint policy are rejected.
-- Safe resume handoff through `codex resume <conversation-id>`.
+- Resume handoff with `codex --no-daemon resume -C <directory> <conversation-id>`;
+  use `cdx --allow-daemon` to allow the shared background server.
 
 ## Installation
 

@@ -66,6 +66,8 @@ pub struct RunConfig {
     pub codex_bin: String,
     /// Prints the resume command instead of executing it.
     pub dry_run: bool,
+    /// Allows Codex to use its shared daemon instead of passing `--no-daemon`.
+    pub allow_daemon: bool,
     /// Includes spawned subagent conversations in the picker.
     pub include_subagents: bool,
 }
@@ -844,6 +846,7 @@ fn effective_updated_at_ms(recency_at_ms: i64, updated_at_ms: i64) -> Option<i64
 /// Returns an error when loading conversations, determining the current
 /// directory, running the picker, or resuming the selected conversation fails.
 pub fn run_default(config: RunConfig) -> Result<()> {
+    let allow_daemon = config.allow_daemon;
     run_with(
         config,
         |db_path, session_index_path| {
@@ -851,7 +854,9 @@ pub fn run_default(config: RunConfig) -> Result<()> {
         },
         env::current_dir,
         select_conversation,
-        resume_conversation,
+        |bin, id, cwd, dry_run| {
+            resume_conversation_with_daemon(bin, id, cwd, dry_run, allow_daemon)
+        },
     )
 }
 
@@ -1088,6 +1093,8 @@ fn init_terminal_session_impl<B, T>(
 /// Returns initialization, restore, or work errors from the provided callbacks.
 /// Resumes the selected conversation with the configured `codex` binary.
 ///
+/// Codex runs with `--no-daemon` by default.
+///
 /// # Errors
 ///
 /// Returns an error when writing dry-run output, spawning the subprocess, or
@@ -1098,27 +1105,43 @@ pub fn resume_conversation(
     cwd: &str,
     dry_run: bool,
 ) -> Result<()> {
+    resume_conversation_with_daemon(codex_bin, conversation_id, cwd, dry_run, false)
+}
+
+fn resume_conversation_with_daemon(
+    codex_bin: &str,
+    conversation_id: &str,
+    cwd: &str,
+    dry_run: bool,
+    allow_daemon: bool,
+) -> Result<()> {
     if dry_run {
         let mut stdout = io::stdout();
-        return write_dry_run_output(&mut stdout, codex_bin, conversation_id, cwd);
+        return write_dry_run_output(&mut stdout, codex_bin, conversation_id, cwd, allow_daemon);
     }
 
-    resume_subprocess_conversation(codex_bin, conversation_id, cwd)
+    resume_subprocess_conversation(codex_bin, conversation_id, cwd, allow_daemon)
 }
 
 fn resume_command_status(
     codex_bin: &str,
     conversation_id: &str,
     cwd: &str,
+    allow_daemon: bool,
 ) -> Result<std::process::ExitStatus> {
-    match Command::new(codex_bin)
+    let mut command = Command::new(codex_bin);
+    let flag = if allow_daemon { "" } else { "--no-daemon " };
+    if !allow_daemon {
+        command.arg("--no-daemon");
+    }
+    match command
         .args(["resume", "-C", cwd, conversation_id])
         .current_dir(cwd)
         .status()
     {
         Ok(status) => Ok(status),
         Err(error) => Err(error).context(format!(
-            "failed to execute `{codex_bin} resume -C {cwd} {conversation_id}`"
+            "failed to execute `{codex_bin} {flag}resume -C {cwd} {conversation_id}`"
         )),
     }
 }
@@ -1135,17 +1158,27 @@ fn classify_resume_status(result: Result<std::process::ExitStatus>) -> ResumeSta
     }
 }
 
-fn resume_subprocess_conversation(codex_bin: &str, conversation_id: &str, cwd: &str) -> Result<()> {
-    let status =
-        match classify_resume_status(resume_command_status(codex_bin, conversation_id, cwd)) {
-            ResumeStatusResult::Status(status) => status,
-            ResumeStatusResult::Error(error) => return Err(error),
-        };
+fn resume_subprocess_conversation(
+    codex_bin: &str,
+    conversation_id: &str,
+    cwd: &str,
+    allow_daemon: bool,
+) -> Result<()> {
+    let status = match classify_resume_status(resume_command_status(
+        codex_bin,
+        conversation_id,
+        cwd,
+        allow_daemon,
+    )) {
+        ResumeStatusResult::Status(status) => status,
+        ResumeStatusResult::Error(error) => return Err(error),
+    };
 
     if status.success() {
         Ok(())
     } else {
-        bail!("`{codex_bin} resume -C {cwd} {conversation_id}` exited with {status}");
+        let flag = if allow_daemon { "" } else { "--no-daemon " };
+        bail!("`{codex_bin} {flag}resume -C {cwd} {conversation_id}` exited with {status}");
     }
 }
 

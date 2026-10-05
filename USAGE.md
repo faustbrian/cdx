@@ -13,10 +13,15 @@ cdx
 --session-index-path <PATH>  Override the Codex session index JSONL file
 --codex-bin <NAME>           Override the resume command binary
 --dry-run                    Print the resume command instead of executing it
+--allow-daemon               Omit the default Codex --no-daemon flag
 --include-subagents          Start with spawned subagent threads visible
 ```
 
 ## Controls
+
+Codex resumes with `--no-daemon` by default. Use `cdx --allow-daemon` to
+allow Codex to use its shared background server instead. The conversation's
+working directory is still passed with `-C` in either mode.
 
 - `type` to search
 - `Backspace` to delete query text

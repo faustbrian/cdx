@@ -2227,6 +2227,7 @@ fn run_with_rejects_empty_conversation_lists() {
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
             dry_run: false,
+            allow_daemon: false,
             include_subagents: false,
         },
         |_db_path, _session_index_path| Ok(Vec::new()),
@@ -2250,6 +2251,7 @@ fn run_with_propagates_current_directory_failures() {
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
             dry_run: false,
+            allow_daemon: false,
             include_subagents: false,
         },
         |_db_path, _session_index_path| {
@@ -2284,6 +2286,7 @@ fn run_with_selects_and_resumes_conversation() {
             session_index_path: Some(PathBuf::from("/tmp/session_index.jsonl")),
             codex_bin: "codex-bin".to_string(),
             dry_run: true,
+            allow_daemon: false,
             include_subagents: false,
         },
         |db_path, session_index_path| {
@@ -2339,6 +2342,7 @@ fn run_with_can_include_subagents_from_real_state() {
             session_index_path: Some(temp_dir.path().join("missing.jsonl")),
             codex_bin: "codex-bin".to_string(),
             dry_run: true,
+            allow_daemon: false,
             include_subagents: true,
         },
         |db_path, session_index_path| {
@@ -2398,6 +2402,7 @@ fn run_with_propagates_include_subagents_loader_errors() {
             session_index_path: Some(temp_dir.path().join("missing.jsonl")),
             codex_bin: "codex-bin".to_string(),
             dry_run: true,
+            allow_daemon: false,
             include_subagents: true,
         },
         |db_path, session_index_path| {
@@ -2421,6 +2426,7 @@ fn run_with_propagates_load_failures() {
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
             dry_run: false,
+            allow_daemon: false,
             include_subagents: false,
         },
         |_db_path, _session_index_path| Err(anyhow::anyhow!("load failed")),
@@ -2444,6 +2450,7 @@ fn run_with_propagates_selection_failures() {
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
             dry_run: false,
+            allow_daemon: false,
             include_subagents: false,
         },
         |_db_path, _session_index_path| {
@@ -2560,32 +2567,50 @@ fn select_conversation_supports_fake_terminal_mode() {
 
 #[test]
 fn run_default_supports_fake_terminal_mode() {
-    let temp_dir = TestDir::new("run-default");
-    let db_path = temp_dir.path().join("state.sqlite");
-    let codex_path = temp_dir.path().join("fake-codex.sh");
-    let log_path = temp_dir.path().join("resume.log");
+    for allow_daemon in [false, true] {
+        let temp_dir = TestDir::new("run-default");
+        let db_path = temp_dir.path().join("state.sqlite");
+        let codex_path = temp_dir.path().join("fake-codex.sh");
+        let log_path = temp_dir.path().join("resume.log");
 
-    seed_threads_db(&db_path);
-    write_executable(
-        &codex_path,
-        &format!(
-            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" > '{}'\n",
-            log_path.display()
-        ),
-    );
+        seed_threads_db(&db_path);
+        let connection = Connection::open(&db_path)
+            .unwrap_or_else(|_| unreachable!("fixture database should open"));
+        connection
+            .execute(
+                "update threads set cwd = ?1",
+                [&temp_dir.path().display().to_string()],
+            )
+            .unwrap_or_else(|_| unreachable!("fixture cwd should update"));
+        write_executable(
+            &codex_path,
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" > '{}'\n",
+                log_path.display()
+            ),
+        );
 
-    let result = run_default(RunConfig {
-        db_path: Some(db_path),
-        session_index_path: Some(temp_dir.path().join("missing.jsonl")),
-        codex_bin: codex_path.display().to_string(),
-        dry_run: false,
-        include_subagents: false,
-    });
-    assert!(result.is_ok());
+        let result = run_default(RunConfig {
+            db_path: Some(db_path),
+            session_index_path: Some(temp_dir.path().join("missing.jsonl")),
+            codex_bin: codex_path.display().to_string(),
+            dry_run: false,
+            allow_daemon,
+            include_subagents: false,
+        });
+        assert!(result.is_ok());
 
-    let log = fs::read_to_string(&log_path)
-        .unwrap_or_else(|_| unreachable!("resume log should be written"));
-    assert_eq!(log.trim(), "resume thread-1");
+        let log = fs::read_to_string(&log_path)
+            .unwrap_or_else(|_| unreachable!("resume log should be written"));
+        assert_eq!(
+            log.trim(),
+            if allow_daemon {
+                "resume -C"
+            } else {
+                "--no-daemon resume"
+            }
+        );
+    }
 }
 
 #[test]
@@ -3066,8 +3091,7 @@ fn resume_conversation_executes_subprocess_and_reports_failures() {
     write_executable(
         &success_script,
         &format!(
-            "#!/bin/sh\n[ \"$1\" = \"resume\" ] && [ \"$2\" = \"-C\" ] && [ \"$3\" = \"{}\" ] && [ \"$4\" = \"thread-1\" ]\n",
-            cwd
+            "#!/bin/sh\n[ \"$1\" = \"--no-daemon\" ] && [ \"$2\" = \"resume\" ] && [ \"$3\" = \"-C\" ] && [ \"$4\" = \"{cwd}\" ] && [ \"$5\" = \"thread-1\" ]\n"
         ),
     );
     write_executable(&failure_script, "#!/bin/sh\nexit 17\n");
@@ -3089,28 +3113,48 @@ fn resume_conversation_executes_subprocess_and_reports_failures() {
     .err()
     .unwrap_or_else(|| unreachable!("non-zero exit status should fail"));
     assert!(error.to_string().contains("exited with"));
+    let error = super::resume_conversation_with_daemon(
+        failure_script.to_str().unwrap_or(""),
+        "thread-1",
+        &cwd,
+        false,
+        true,
+    )
+    .err()
+    .unwrap_or_else(|| unreachable!("non-zero exit status should fail with daemon allowed"));
+    assert!(error.to_string().contains("exited with"));
+    assert!(!error.to_string().contains("--no-daemon"));
 }
 
 #[test]
 fn write_dry_run_output_writes_and_reports_errors() {
     let mut buffer = Vec::new();
 
-    let result = write_dry_run_output(&mut buffer, "codex", "thread-1", "/tmp/example");
+    let result = write_dry_run_output(&mut buffer, "codex", "thread-1", "/tmp/example", false);
     assert!(result.is_ok());
     assert_eq!(
         String::from_utf8(buffer).unwrap_or_else(|_| unreachable!("utf8 should decode")),
-        "codex resume -C /tmp/example thread-1\n"
+        "codex --no-daemon resume -C /tmp/example thread-1\n"
     );
 
-    let error = write_dry_run_output(&mut FailingWriter, "codex", "thread-1", "/tmp/example")
-        .err()
-        .unwrap_or_else(|| unreachable!("writer failures should propagate"));
+    let error = write_dry_run_output(
+        &mut FailingWriter,
+        "codex",
+        "thread-1",
+        "/tmp/example",
+        false,
+    )
+    .err()
+    .unwrap_or_else(|| unreachable!("writer failures should propagate"));
     assert!(error.to_string().contains("failed to write dry-run output"));
 }
 
 #[test]
 fn resume_conversation_supports_dry_run_mode() {
     let result = resume_conversation("codex", "thread-1", "/tmp/example", true);
+    assert!(result.is_ok());
+    let result =
+        super::resume_conversation_with_daemon("codex", "thread-1", "/tmp/example", true, true);
     assert!(result.is_ok());
 }
 

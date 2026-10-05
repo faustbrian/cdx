@@ -188,8 +188,13 @@ pub(super) fn write_dry_run_output<W: Write>(
     codex_bin: &str,
     conversation_id: &str,
     cwd: &str,
+    allow_daemon: bool,
 ) -> Result<()> {
-    match writeln!(writer, "{codex_bin} resume -C {cwd} {conversation_id}") {
+    let flag = if allow_daemon { "" } else { "--no-daemon " };
+    match writeln!(
+        writer,
+        "{codex_bin} {flag}resume -C {cwd} {conversation_id}"
+    ) {
         Ok(()) => Ok(()),
         Err(error) => Err(error).context("failed to write dry-run output"),
     }

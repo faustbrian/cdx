@@ -17,6 +17,8 @@ struct Cli {
     codex_bin: String,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long, help = "Allow Codex to use its shared background daemon")]
+    allow_daemon: bool,
     #[arg(long, help = "Include spawned subagent conversations")]
     include_subagents: bool,
 }
@@ -36,6 +38,7 @@ fn run() -> Result<()> {
         session_index_path: cli.session_index_path,
         codex_bin: cli.codex_bin,
         dry_run: cli.dry_run,
+        allow_daemon: cli.allow_daemon,
         include_subagents: cli.include_subagents,
     })
 }

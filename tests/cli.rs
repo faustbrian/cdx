@@ -50,71 +50,96 @@ mod tests {
 
     #[test]
     fn dry_run_resume_works_with_fake_terminal() {
-        let temp_dir = TestDir::new("dry-run-terminal");
-        let db_path = temp_dir.path().join("state.sqlite");
-        create_threads_db_with_single_conversation(&db_path, temp_dir.path());
-        let output = Command::new(cdx_bin())
-            .env("CDX_TEST_FAKE_TERMINAL", "1")
-            .args([
+        for allow_daemon in [false, true] {
+            let temp_dir = TestDir::new("dry-run-terminal");
+            let db_path = temp_dir.path().join("state.sqlite");
+            let codex_path = temp_dir.path().join("fake codex.sh");
+            let marker_path = temp_dir.path().join("invoked");
+            write_executable(
+                &codex_path,
+                &format!("#!/bin/sh\ntouch '{}'\n", marker_path.display()),
+            );
+            create_threads_db_with_single_conversation(&db_path, temp_dir.path());
+            let mut command = Command::new(cdx_bin());
+            command.env("CDX_TEST_FAKE_TERMINAL", "1").args([
                 "--db-path",
                 &db_path.display().to_string(),
                 "--session-index-path",
                 &temp_dir.path().join("missing.jsonl").display().to_string(),
                 "--dry-run",
-            ])
-            .output()
-            .unwrap_or_else(|_| unreachable!("dry-run command should finish"));
+                "--codex-bin",
+                &codex_path.display().to_string(),
+            ]);
+            if allow_daemon {
+                command.arg("--allow-daemon");
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|_| unreachable!("dry-run command should finish"));
 
-        assert!(output.status.success());
+            assert!(output.status.success());
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let expected = format!("codex resume -C {} thread-1", temp_dir.path().display());
-        assert!(stdout.contains(&expected));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let flag = if allow_daemon { "" } else { "--no-daemon " };
+            let expected = format!(
+                "{} {flag}resume -C {} thread-1\n",
+                codex_path.display(),
+                temp_dir.path().display()
+            );
+            assert_eq!(stdout, expected);
+            assert!(!marker_path.exists());
+        }
     }
 
     #[test]
     fn subprocess_resume_works_with_fake_terminal() {
-        let temp_dir = TestDir::new("resume-terminal");
-        let db_path = temp_dir.path().join("state.sqlite");
-        let codex_path = temp_dir.path().join("fake-codex.sh");
-        let log_path = temp_dir.path().join("resume.log");
+        for allow_daemon in [false, true] {
+            let temp_dir = TestDir::new("resume-terminal");
+            let db_path = temp_dir.path().join("state.sqlite");
+            let codex_path = temp_dir.path().join("fake-codex.sh");
+            let log_path = temp_dir.path().join("resume.log");
 
-        create_threads_db_with_single_conversation(&db_path, temp_dir.path());
-        write_executable(
-            &codex_path,
-            &format!(
-                "#!/bin/sh\nprintf '%s|%s|%s|%s|%s\\n' \"$PWD\" \"$1\" \"$2\" \"$3\" \"$4\" > '{}'\n",
-                log_path.display()
-            ),
-        );
+            create_threads_db_with_single_conversation(&db_path, temp_dir.path());
+            write_executable(
+                &codex_path,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > '{}'\n",
+                    log_path.display()
+                ),
+            );
 
-        let output = Command::new(cdx_bin())
-            .env("CDX_TEST_FAKE_TERMINAL", "1")
-            .args([
+            let mut command = Command::new(cdx_bin());
+            command.env("CDX_TEST_FAKE_TERMINAL", "1").args([
                 "--db-path",
                 &db_path.display().to_string(),
                 "--session-index-path",
                 &temp_dir.path().join("missing.jsonl").display().to_string(),
                 "--codex-bin",
                 &codex_path.display().to_string(),
-            ])
-            .output()
-            .unwrap_or_else(|_| unreachable!("resume command should finish"));
+            ]);
+            if allow_daemon {
+                command.arg("--allow-daemon");
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|_| unreachable!("resume command should finish"));
 
-        assert!(output.status.success());
+            assert!(output.status.success());
 
-        let log = fs::read_to_string(&log_path)
-            .unwrap_or_else(|_| unreachable!("resume log should be written"));
-        let canonical_cwd = fs::canonicalize(temp_dir.path())
-            .unwrap_or_else(|_| unreachable!("temp cwd should canonicalize"));
-        assert_eq!(
-            log.trim(),
-            format!(
-                "{}|resume|-C|{}|thread-1",
-                canonical_cwd.display(),
-                temp_dir.path().display()
-            )
-        );
+            let log = fs::read_to_string(&log_path)
+                .unwrap_or_else(|_| unreachable!("resume log should be written"));
+            let canonical_cwd = fs::canonicalize(temp_dir.path())
+                .unwrap_or_else(|_| unreachable!("temp cwd should canonicalize"));
+            let flag = if allow_daemon { "" } else { "--no-daemon\n" };
+            assert_eq!(
+                log,
+                format!(
+                    "{}\n{flag}resume\n-C\n{}\nthread-1\n",
+                    canonical_cwd.display(),
+                    temp_dir.path().display()
+                )
+            );
+        }
     }
 
     fn cdx_bin() -> &'static str {
