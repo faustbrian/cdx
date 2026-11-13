@@ -1500,7 +1500,7 @@ fn load_conversations_returns_empty_when_no_active_threads_exist() {
     let conversations = load_conversations(&db_path, &temp_dir.path().join("missing.jsonl"))
         .unwrap_or_else(|_| unreachable!("empty database should load"));
 
-    assert!(conversations.is_empty());
+    assert_eq!(conversations, Vec::<Conversation>::new());
 }
 
 #[test]
@@ -3400,10 +3400,10 @@ fn load_claude_conversations_reads_sessions_and_hides_non_interactive_ones() {
     assert_eq!(ids, vec!["session-a", "session-b", "session-d"]);
     assert!(all.iter().any(|conversation| conversation.is_subagent));
 
-    assert!(
+    assert_eq!(
         load_claude_conversations(&temp_dir.path().join("missing"), false)
-            .unwrap_or_else(|_| unreachable!("missing projects dir should be empty"))
-            .is_empty()
+            .unwrap_or_else(|_| unreachable!("missing projects dir should be empty")),
+        Vec::<Conversation>::new()
     );
 }
 
@@ -3923,6 +3923,6 @@ fn missing_codex_database_yields_no_conversations_without_creating_it() {
     let conversations = load_conversations(&db_path, &temp_dir.path().join("missing.jsonl"))
         .unwrap_or_else(|_| unreachable!("a missing database should be empty"));
 
-    assert!(conversations.is_empty());
+    assert_eq!(conversations, Vec::<Conversation>::new());
     assert!(!db_path.exists());
 }
