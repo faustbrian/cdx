@@ -7,12 +7,14 @@
 [![TUI](https://img.shields.io/badge/interface-terminal-informational.svg)](USAGE.md)
 [![Scorecards](https://api.scorecard.dev/projects/github.com/faustbrian/cdx/badge)](https://scorecard.dev/viewer/?uri=github.com/faustbrian/cdx)
 
-`cdx` is a strict local-first Rust CLI for browsing Codex conversations across
-all directories on a machine and resuming them with the native `codex resume`
-command.
+`cdx` is a strict local-first Rust CLI for browsing Claude Code and Codex
+conversations across all directories on a machine and resuming them with the
+native `claude --resume` or `codex resume` command.
 
 ## Features
 
+- Claude Code sessions from `~/.claude/projects` and Codex threads in one
+  picker, with an `Agent` filter that starts on Claude and orange Claude rows.
 - Global conversation index backed by the local Codex thread store.
 - Search across conversation title, preview, working directory, and id.
 - Search normalization that ignores punctuation, so `invoicerepair` matches
@@ -63,7 +65,10 @@ Optional overrides:
 ```bash
 cdx --db-path ~/.codex/state_5.sqlite \
     --session-index-path ~/.codex/session_index.jsonl \
-    --codex-bin codex
+    --codex-bin codex \
+    --claude-projects-path ~/.claude/projects \
+    --claude-bin claude \
+    --agent claude
 ```
 
 Start with spawned subagent threads already visible when you explicitly want
@@ -79,8 +84,8 @@ cdx --include-subagents
 - `Backspace` to delete search input
 - `Ctrl+U` to clear the current search
 - `Esc` to clear the search, then exit when already empty
-- `Tab` / `Shift+Tab` to focus search, filter, threads, or sort
-- `Left` / `Right` or `Space` to change the focused filter, threads, or sort option
+- `Tab` / `Shift+Tab` to focus search, agent, filter, threads, or sort
+- `Left` / `Right` or `Space` to change the focused agent, filter, threads, or sort option
 - `Ctrl+V` to toggle between `Core` and `Full` columns
 - `Ctrl+O` to toggle between `Compact` and `Comfortable` row modes
 - `Up` / `Down` to move through results

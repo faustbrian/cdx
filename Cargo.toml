@@ -3,7 +3,7 @@ name = "cdx"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Global Codex conversation picker for local chat history"
+description = "Global Claude Code and Codex conversation picker for local chat history"
 license = "MIT"
 repository = "https://github.com/faustbrian/cdx"
 homepage = "https://github.com/faustbrian/cdx"
@@ -21,7 +21,7 @@ include = [
   "src/**/*.rs",
   "tests/**/*.rs",
 ]
-keywords = ["codex", "cli", "tui", "history", "search"]
+keywords = ["claude", "codex", "cli", "tui", "history"]
 categories = ["command-line-utilities"]
 
 [dependencies]

@@ -4,6 +4,9 @@ All notable changes to `cdx` will be documented in this file.
 
 ## Unreleased
 
+- Claude Code sessions from `~/.claude/projects` alongside Codex threads,
+  with an `Agent` filter (Claude, Codex, All) that starts on Claude, an
+  agent column, and an orange selection highlight for Claude rows.
 - Initial global Codex conversation picker implementation.
 - Search, filter, sort, and recency-aware terminal UI.
 - Search-bar controls now reserve safe width so sort and filter labels do not

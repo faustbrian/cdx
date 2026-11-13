@@ -1,11 +1,14 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::Write;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::claude::{SessionFile, SessionHead};
 use crate::{App, Conversation, FocusTarget, ThreadRow};
 
 pub(super) fn display_title(id: &str, thread_name: Option<&str>, title: Option<&str>) -> String {
@@ -268,4 +271,121 @@ pub(super) fn handle_key_event(app: &mut App, key: KeyEvent) -> Result<Option<Co
     }
 
     Ok(None)
+}
+
+/// Reads the head of every `<projects>/<project>/<session>.jsonl` file.
+///
+/// A missing projects directory yields no sessions, so machines without
+/// Claude Code still show their Codex history.
+pub(super) fn read_session_files(
+    projects_path: &Path,
+    head_bytes: u64,
+    tail_bytes: u64,
+) -> Result<Vec<SessionFile>> {
+    let project_dirs = match fs::read_dir(projects_path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).context(format!("failed to read {}", projects_path.display()));
+        }
+    };
+
+    let mut sessions = Vec::new();
+    for project_dir in project_dirs {
+        let project_dir = project_dir
+            .context(format!("failed to read {}", projects_path.display()))?
+            .path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        for path in jsonl_files(&project_dir)? {
+            sessions.extend(read_session_file(&path, head_bytes, tail_bytes)?);
+        }
+    }
+
+    Ok(sessions)
+}
+
+fn jsonl_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(dir).context(format!("failed to read {}", dir.display()))? {
+        let path = entry
+            .context(format!("failed to read {}", dir.display()))?
+            .path();
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            paths.push(path);
+        }
+    }
+
+    Ok(paths)
+}
+
+/// Returns `None` for a session deleted after its directory was listed, which
+/// Claude Code does when it cleans up old transcripts on startup.
+fn read_session_file(path: &Path, head_bytes: u64, tail_bytes: u64) -> Result<Option<SessionFile>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context(format!("failed to open {}", path.display())),
+    };
+    let updated_at_ms = modified_at_ms(&file).context(format!(
+        "failed to read modification time of {}",
+        path.display()
+    ))?;
+    let mut head = read_session_head(BufReader::new((&file).take(head_bytes)))
+        .context(format!("failed to read {}", path.display()))?;
+    read_session_tail(&file, tail_bytes, &mut head)
+        .context(format!("failed to read {}", path.display()))?;
+
+    Ok(Some(SessionFile {
+        id: path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        head,
+        updated_at_ms,
+    }))
+}
+
+fn read_session_tail(file: &File, tail_bytes: u64, head: &mut SessionHead) -> io::Result<()> {
+    let length = file.metadata()?.len();
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(length.saturating_sub(tail_bytes)))?;
+
+    // The seek usually lands mid-record; that first fragment fails to parse
+    // and is skipped like any other unusable line.
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(());
+        }
+        head.absorb_tail_line(&line);
+    }
+}
+
+fn modified_at_ms(file: &File) -> io::Result<i64> {
+    let modified = file.metadata()?.modified()?;
+    let since_epoch = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+
+    i64::try_from(since_epoch.as_millis()).map_err(io::Error::other)
+}
+
+pub(super) fn read_session_head<R: BufRead>(mut reader: R) -> io::Result<SessionHead> {
+    let mut head = SessionHead::default();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 || head.absorb_line(&line) {
+            return Ok(head);
+        }
+    }
 }

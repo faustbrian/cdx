@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -14,23 +14,27 @@ use ratatui::backend::TestBackend;
 use rusqlite::Connection;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 
-use super::coverage_excluded::handle_key_event;
+use super::claude::{
+    SessionHead, default_claude_projects_path, default_claude_projects_path_from_home,
+};
+use super::coverage_excluded::{handle_key_event, read_session_head};
 use super::{
-    App, ColumnPreset, ControlsVariant, Conversation, FilterMode, FocusTarget, PREVIEW_LIMIT,
-    RecencyBucket, RowMode, RunConfig, SortMode, SubagentMode, ThreadRow, column_exists,
-    compact_filter_label, compact_sort_label, compact_subagent_label, controls_variant_for_width,
-    controls_width, deduplicate_conversations, default_session_index_path,
-    default_session_index_path_from_home, default_state_db_path, default_state_db_path_from_home,
-    detect_subagent_thread_ids, display_title, effective_updated_at_ms, excerpt_column_width,
-    excerpt_lines, finish_draw, format_actual_time, format_relative_delta, format_relative_time,
-    format_relative_time_at, home_dir, init_terminal_session, load_conversations,
+    Agent, AgentMode, App, ColumnPreset, ControlStyles, ControlsVariant, Conversation, FilterMode,
+    FocusTarget, PREVIEW_LIMIT, RecencyBucket, RowMode, RunConfig, SortMode, SubagentMode,
+    ThreadRow, column_exists, compact_filter_label, compact_sort_label, compact_subagent_label,
+    controls_variant_for_width, controls_width, deduplicate_conversations,
+    default_session_index_path, default_session_index_path_from_home, default_state_db_path,
+    default_state_db_path_from_home, detect_subagent_thread_ids, display_title,
+    effective_updated_at_ms, excerpt_column_width, excerpt_lines, finish_draw, format_actual_time,
+    format_relative_delta, format_relative_time, format_relative_time_at, home_dir,
+    init_terminal_session, load_claude_conversations, load_conversations,
     load_conversations_with_options, load_thread_names, load_thread_query_support, next_thread_row,
     normalize_search_text, preview_text, recency_bucket_at, recency_bucket_from_delta, render,
-    render_cwd, render_cwd_with_home, restore_terminal_session, resume_conversation, run_default,
-    run_picker_loop, run_with, select_conversation, select_conversation_with_session,
-    table_columns, table_exists, table_row, thread_row_from_sql_row, tight_filter_label,
-    tight_sort_label, tight_subagent_label, truncate_to_width, with_terminal_session,
-    write_dry_run_output,
+    render_cwd, render_cwd_with_home, restore_terminal_session, resume_claude_conversation,
+    resume_conversation, run_default, run_picker_loop, run_with, select_conversation,
+    select_conversation_with_session, table_columns, table_exists, table_row,
+    thread_row_from_sql_row, tight_filter_label, tight_sort_label, tight_subagent_label,
+    truncate_to_width, with_terminal_session, write_dry_run_output,
 };
 
 fn run_picker_app<FSelect, FResume>(
@@ -602,20 +606,30 @@ fn filter_sort_and_focus_cycle_in_both_directions() {
     assert_eq!(SortMode::Updated.next(), SortMode::Created);
     assert_eq!(SortMode::Created.previous(), SortMode::Updated);
 
-    assert_eq!(FocusTarget::Search.next(), FocusTarget::Filter);
+    assert_eq!(AgentMode::Claude.next(), AgentMode::Codex);
+    assert_eq!(AgentMode::Codex.next(), AgentMode::All);
+    assert_eq!(AgentMode::All.next(), AgentMode::Claude);
+    assert_eq!(AgentMode::Claude.previous(), AgentMode::All);
+    assert_eq!(AgentMode::Codex.previous(), AgentMode::Claude);
+    assert_eq!(AgentMode::All.previous(), AgentMode::Codex);
+
+    assert_eq!(FocusTarget::Search.next(), FocusTarget::Agent);
+    assert_eq!(FocusTarget::Agent.next(), FocusTarget::Filter);
     assert_eq!(FocusTarget::Filter.next(), FocusTarget::Subagents);
     assert_eq!(FocusTarget::Subagents.next(), FocusTarget::Sort);
     assert_eq!(FocusTarget::Sort.next(), FocusTarget::Search);
 
     assert_eq!(FocusTarget::Search.previous(), FocusTarget::Sort);
-    assert_eq!(FocusTarget::Filter.previous(), FocusTarget::Search);
+    assert_eq!(FocusTarget::Agent.previous(), FocusTarget::Search);
+    assert_eq!(FocusTarget::Filter.previous(), FocusTarget::Agent);
     assert_eq!(FocusTarget::Subagents.previous(), FocusTarget::Filter);
     assert_eq!(FocusTarget::Sort.previous(), FocusTarget::Subagents);
 }
 
 #[test]
 fn focus_cycles_forward_and_backward() {
-    assert_eq!(FocusTarget::Search.next(), FocusTarget::Filter);
+    assert_eq!(FocusTarget::Search.next(), FocusTarget::Agent);
+    assert_eq!(FocusTarget::Agent.next(), FocusTarget::Filter);
     assert_eq!(FocusTarget::Filter.next(), FocusTarget::Subagents);
     assert_eq!(FocusTarget::Subagents.next(), FocusTarget::Sort);
     assert_eq!(FocusTarget::Sort.next(), FocusTarget::Search);
@@ -1562,6 +1576,11 @@ fn handle_key_event_updates_app_state_and_returns_selection() {
     let key_result = handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     let key_result = key_result.unwrap_or_else(|_| unreachable!("tab should succeed"));
     assert!(key_result.is_none());
+    assert_eq!(app.focus, FocusTarget::Agent);
+
+    let key_result = handle_key_event(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let key_result = key_result.unwrap_or_else(|_| unreachable!("tab should succeed"));
+    assert!(key_result.is_none());
     assert_eq!(app.focus, FocusTarget::Filter);
 
     let key_result = handle_key_event(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
@@ -1577,6 +1596,14 @@ fn handle_key_event_updates_app_state_and_returns_selection() {
     assert!(key_result.is_none());
     assert_eq!(app.filter_mode, FilterMode::All);
     assert_eq!(app.query, "");
+
+    let key_result = handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    );
+    let key_result = key_result.unwrap_or_else(|_| unreachable!("backtab should succeed"));
+    assert!(key_result.is_none());
+    assert_eq!(app.focus, FocusTarget::Agent);
 
     let key_result = handle_key_event(
         &mut app,
@@ -1727,14 +1754,16 @@ fn render_shows_search_controls_and_results_table() {
     );
     let screen = render_to_string(&app);
 
-    assert!(screen.contains("Resume a previous session"));
+    assert!(screen.contains("Resume a previous Claude or Codex session"));
     assert!(screen.contains("Type to search"));
+    assert!(screen.contains("Agent: [Claude] Codex All"));
+    assert!(screen.contains("● Claude"));
     assert!(screen.contains("Filter: Cwd [All]"));
     assert!(screen.contains("Threads: [Primary] All"));
     assert!(screen.contains("Sort: [Updated] Created"));
     assert!(screen.contains("Conversation"));
     assert!(screen.contains("Excerpt"));
-    assert!(!screen.contains("Age"));
+    assert!(!screen.contains("Age "));
     assert!(!screen.contains("  Updated         "));
     assert!(screen.contains("alpha"));
     assert!(screen.contains("preview text"));
@@ -1754,7 +1783,7 @@ fn render_keeps_sort_visible_on_narrow_terminals() {
         "/tmp/api".to_string(),
     );
 
-    let screen = render_to_string_with_size(&app, 110, 20);
+    let screen = render_to_string_with_size(&app, 116, 20);
 
     assert!(screen.contains("Sort: [Updated] Created"), "{screen}");
 }
@@ -1773,13 +1802,13 @@ fn control_variants_select_full_compact_and_tight_layouts() {
         "/tmp/api".to_string(),
     );
 
-    assert_eq!(controls_variant_for_width(&app, 110), ControlsVariant::Full);
+    assert_eq!(controls_variant_for_width(&app, 116), ControlsVariant::Full);
     assert_eq!(
-        controls_variant_for_width(&app, 86),
+        controls_variant_for_width(&app, 115),
         ControlsVariant::Compact
     );
     assert_eq!(
-        controls_variant_for_width(&app, 80),
+        controls_variant_for_width(&app, 86),
         ControlsVariant::Compact
     );
 
@@ -1829,9 +1858,12 @@ fn tight_controls_render_short_labels_for_alternate_modes() {
 
     let line = ControlsVariant::Tight.line(
         &app,
-        ratatui::style::Style::default(),
-        ratatui::style::Style::default(),
-        ratatui::style::Style::default(),
+        ControlStyles {
+            agent: ratatui::style::Style::default(),
+            filter: ratatui::style::Style::default(),
+            subagent: ratatui::style::Style::default(),
+            sort: ratatui::style::Style::default(),
+        },
     );
 
     let rendered = line
@@ -1840,8 +1872,8 @@ fn tight_controls_render_short_labels_for_alternate_modes() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(ControlsVariant::Tight.width(&app), 17);
-    assert_eq!(rendered, "F:[A] T:[A] S:[C]");
+    assert_eq!(ControlsVariant::Tight.width(&app), 24);
+    assert_eq!(rendered, "A:[Cl] F:[A] T:[A] S:[C]");
 }
 
 #[test]
@@ -1860,9 +1892,12 @@ fn minimal_controls_render_shortest_labels_for_default_modes() {
 
     let line = ControlsVariant::Minimal.line(
         &app,
-        ratatui::style::Style::default(),
-        ratatui::style::Style::default(),
-        ratatui::style::Style::default(),
+        ControlStyles {
+            agent: ratatui::style::Style::default(),
+            filter: ratatui::style::Style::default(),
+            subagent: ratatui::style::Style::default(),
+            sort: ratatui::style::Style::default(),
+        },
     );
 
     let rendered = line
@@ -1871,8 +1906,8 @@ fn minimal_controls_render_shortest_labels_for_default_modes() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(ControlsVariant::Minimal.width(&app), 14);
-    assert_eq!(rendered, "F[A] T[P] S[U]");
+    assert_eq!(ControlsVariant::Minimal.width(&app), 20);
+    assert_eq!(rendered, "A[Cl] F[A] T[P] S[U]");
 }
 
 #[test]
@@ -1946,6 +1981,7 @@ fn render_status_shows_all_threads_when_subagents_are_visible() {
         ],
         "/tmp/api".to_string(),
         true,
+        AgentMode::Claude,
     );
 
     let screen = render_to_string(&app);
@@ -2009,7 +2045,7 @@ fn render_uses_minimal_controls_before_truncating_sort() {
 
     let screen = render_to_string_with_size(&app, 40, 20);
 
-    assert!(screen.contains("S:[U]"), "{screen}");
+    assert!(screen.contains("S[U]"), "{screen}");
 }
 
 #[test]
@@ -2068,8 +2104,8 @@ fn table_columns_return_expected_headers_and_widths() {
     let (_core_header, core_widths) = table_columns(ColumnPreset::Core);
     let (_full_header, full_widths) = table_columns(ColumnPreset::Full);
 
-    assert_eq!(core_widths.len(), 3);
-    assert_eq!(full_widths.len(), 5);
+    assert_eq!(core_widths.len(), 4);
+    assert_eq!(full_widths.len(), 6);
 }
 
 #[test]
@@ -2226,21 +2262,28 @@ fn run_with_rejects_empty_conversation_lists() {
             db_path: None,
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: false,
             allow_daemon: false,
             include_subagents: false,
+            agent_mode: AgentMode::Codex,
         },
         |_db_path, _session_index_path| Ok(Vec::new()),
         || Ok(PathBuf::from("/tmp/api")),
         |_| unreachable!("selection should not run"),
-        |_, _, _, _| unreachable!("resume should not run"),
+        |_, _, _, _, _| unreachable!("resume should not run"),
     );
 
     let error = result
         .err()
         .unwrap_or_else(|| unreachable!("empty conversation lists should fail"));
 
-    assert!(error.to_string().contains("no Codex conversations found"));
+    assert!(
+        error
+            .to_string()
+            .contains("no Claude or Codex conversations found")
+    );
 }
 
 #[test]
@@ -2250,9 +2293,12 @@ fn run_with_propagates_current_directory_failures() {
             db_path: None,
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: false,
             allow_daemon: false,
             include_subagents: false,
+            agent_mode: AgentMode::Codex,
         },
         |_db_path, _session_index_path| {
             Ok(vec![conversation(
@@ -2261,7 +2307,7 @@ fn run_with_propagates_current_directory_failures() {
         },
         || Err(io::Error::other("cwd failed")),
         |_| unreachable!("selection should not run"),
-        |_, _, _, _| unreachable!("resume should not run"),
+        |_, _, _, _, _| unreachable!("resume should not run"),
     );
 
     let error = result
@@ -2285,9 +2331,12 @@ fn run_with_selects_and_resumes_conversation() {
             db_path: Some(PathBuf::from("/tmp/custom.sqlite")),
             session_index_path: Some(PathBuf::from("/tmp/session_index.jsonl")),
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: true,
             allow_daemon: false,
             include_subagents: false,
+            agent_mode: AgentMode::Claude,
         },
         |db_path, session_index_path| {
             assert_eq!(db_path, Path::new("/tmp/custom.sqlite"));
@@ -2303,7 +2352,7 @@ fn run_with_selects_and_resumes_conversation() {
                 "thread-1", "/tmp/api", "alpha", "preview", 30, 10,
             ))
         },
-        move |bin, id, cwd, dry_run| {
+        move |_agent, bin, id, cwd, dry_run| {
             resumed_capture
                 .lock()
                 .unwrap_or_else(|_| unreachable!("resume mutex should lock"))
@@ -2319,7 +2368,7 @@ fn run_with_selects_and_resumes_conversation() {
             .unwrap_or_else(|_| unreachable!("resume mutex should lock"))
             .clone(),
         Some((
-            "codex-bin".to_string(),
+            "claude-bin".to_string(),
             "thread-1".to_string(),
             "/tmp/api".to_string(),
             true,
@@ -2341,9 +2390,12 @@ fn run_with_can_include_subagents_from_real_state() {
             db_path: Some(db_path),
             session_index_path: Some(temp_dir.path().join("missing.jsonl")),
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: true,
             allow_daemon: false,
             include_subagents: true,
+            agent_mode: AgentMode::Codex,
         },
         |db_path, session_index_path| {
             load_conversations_with_options(db_path, session_index_path, true)
@@ -2359,7 +2411,7 @@ fn run_with_can_include_subagents_from_real_state() {
                 ]
             );
 
-            Ok(conversation(
+            Ok(codex_conversation(
                 "thread-child",
                 "/tmp/api",
                 "child",
@@ -2368,7 +2420,7 @@ fn run_with_can_include_subagents_from_real_state() {
                 10,
             ))
         },
-        move |bin, id, cwd, dry_run| {
+        move |_agent, bin, id, cwd, dry_run| {
             resumed_capture
                 .lock()
                 .unwrap_or_else(|_| unreachable!("resume mutex should lock"))
@@ -2401,16 +2453,19 @@ fn run_with_propagates_include_subagents_loader_errors() {
             db_path: Some(temp_dir.path().to_path_buf()),
             session_index_path: Some(temp_dir.path().join("missing.jsonl")),
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: true,
             allow_daemon: false,
             include_subagents: true,
+            agent_mode: AgentMode::Codex,
         },
         |db_path, session_index_path| {
             load_conversations_with_options(db_path, session_index_path, true)
         },
         || Ok(PathBuf::from("/tmp/api")),
         |_app| unreachable!("loader errors should stop before selection"),
-        |_bin, _id, _cwd, _dry_run| unreachable!("loader errors should stop before resume"),
+        |_agent, _bin, _id, _cwd, _dry_run| unreachable!("loader errors should stop before resume"),
     )
     .err()
     .unwrap_or_else(|| unreachable!("directory include-subagents database should fail"));
@@ -2425,14 +2480,17 @@ fn run_with_propagates_load_failures() {
             db_path: None,
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: false,
             allow_daemon: false,
             include_subagents: false,
+            agent_mode: AgentMode::Codex,
         },
         |_db_path, _session_index_path| Err(anyhow::anyhow!("load failed")),
         || Ok(PathBuf::from("/tmp/api")),
         |_| unreachable!("selection should not run"),
-        |_, _, _, _| unreachable!("resume should not run"),
+        |_, _, _, _, _| unreachable!("resume should not run"),
     );
 
     let error = result
@@ -2449,9 +2507,12 @@ fn run_with_propagates_selection_failures() {
             db_path: None,
             session_index_path: None,
             codex_bin: "codex-bin".to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: None,
             dry_run: false,
             allow_daemon: false,
             include_subagents: false,
+            agent_mode: AgentMode::Codex,
         },
         |_db_path, _session_index_path| {
             Ok(vec![conversation(
@@ -2460,7 +2521,7 @@ fn run_with_propagates_selection_failures() {
         },
         || Ok(PathBuf::from("/tmp/api")),
         |_app| Err(anyhow::anyhow!("selection failed")),
-        |_, _, _, _| unreachable!("resume should not run"),
+        |_, _, _, _, _| unreachable!("resume should not run"),
     );
 
     let error = result
@@ -2594,9 +2655,12 @@ fn run_default_supports_fake_terminal_mode() {
             db_path: Some(db_path),
             session_index_path: Some(temp_dir.path().join("missing.jsonl")),
             codex_bin: codex_path.display().to_string(),
+            claude_bin: "claude-bin".to_string(),
+            claude_projects_path: Some(temp_dir.path().join("missing-claude")),
             dry_run: false,
             allow_daemon,
             include_subagents: false,
+            agent_mode: AgentMode::Codex,
         });
         assert!(result.is_ok());
 
@@ -2611,6 +2675,59 @@ fn run_default_supports_fake_terminal_mode() {
             }
         );
     }
+}
+
+#[test]
+fn run_default_resumes_claude_sessions_and_reports_claude_load_errors() {
+    let temp_dir = TestDir::new("run-default-claude");
+    let db_path = temp_dir.path().join("state.sqlite");
+    seed_threads_db(&db_path);
+    let projects = temp_dir.path().join("projects");
+    let project = projects.join("project");
+    fs::create_dir_all(&project).unwrap_or_else(|_| unreachable!("project should create"));
+    fs::write(
+        project.join("session-1.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"content\":\"hi\"}}}}\n",
+            temp_dir.path().display()
+        ),
+    )
+    .unwrap_or_else(|_| unreachable!("session should write"));
+    let config = |claude_projects_path: PathBuf, db_path: &Path| RunConfig {
+        db_path: Some(db_path.to_path_buf()),
+        session_index_path: Some(temp_dir.path().join("missing.jsonl")),
+        claude_projects_path: Some(claude_projects_path),
+        codex_bin: "codex".to_string(),
+        claude_bin: "claude".to_string(),
+        dry_run: true,
+        allow_daemon: false,
+        include_subagents: false,
+        agent_mode: AgentMode::Claude,
+    };
+
+    assert!(run_default(config(projects.clone(), &db_path)).is_ok());
+
+    let error = run_default(config(db_path.clone(), &db_path))
+        .err()
+        .unwrap_or_else(|| unreachable!("a file is not a projects directory"));
+    assert!(error.to_string().contains("failed to read"));
+
+    let error = run_default(config(projects.clone(), temp_dir.path()))
+        .err()
+        .unwrap_or_else(|| unreachable!("a directory is not a Codex database"));
+    assert!(error.to_string().contains("failed to open"));
+
+    let session = fs::File::options()
+        .write(true)
+        .open(project.join("session-1.jsonl"))
+        .unwrap_or_else(|_| unreachable!("session should open"));
+    session
+        .set_modified(UNIX_EPOCH - Duration::from_secs(86_400))
+        .unwrap_or_else(|_| unreachable!("mtime should update"));
+    let error = run_default(config(projects, &db_path))
+        .err()
+        .unwrap_or_else(|| unreachable!("pre-epoch modification times should fail"));
+    assert!(error.to_string().contains("modification time"));
 }
 
 #[test]
@@ -3172,6 +3289,227 @@ fn resume_conversation_reports_spawn_failures() {
     assert!(error.to_string().contains("failed to execute"));
 }
 
+#[test]
+fn resume_claude_conversation_runs_in_session_directory_and_reports_failures() {
+    let temp_dir = TestDir::new("resume-claude");
+    let success_script = temp_dir.path().join("claude-success.sh");
+    let failure_script = temp_dir.path().join("claude-failure.sh");
+    let cwd = temp_dir.path().display().to_string();
+    write_executable(
+        &success_script,
+        "#!/bin/sh\n[ \"$1\" = \"--resume\" ] && [ \"$2\" = \"session-1\" ]\n",
+    );
+    write_executable(&failure_script, "#!/bin/sh\nexit 3\n");
+
+    assert!(
+        resume_claude_conversation(
+            success_script.to_str().unwrap_or(""),
+            "session-1",
+            &cwd,
+            false
+        )
+        .is_ok()
+    );
+    assert!(resume_claude_conversation("claude", "session-1", &cwd, true).is_ok());
+
+    let error = resume_claude_conversation(
+        failure_script.to_str().unwrap_or(""),
+        "session-1",
+        &cwd,
+        false,
+    )
+    .err()
+    .unwrap_or_else(|| unreachable!("non-zero exit status should fail"));
+    assert!(error.to_string().contains("exited with"));
+    assert!(error.to_string().contains("--resume session-1"));
+
+    let error = resume_claude_conversation("/definitely/missing/claude", "session-1", &cwd, false)
+        .err()
+        .unwrap_or_else(|| unreachable!("spawn failures should propagate"));
+    assert!(error.to_string().contains("failed to execute"));
+}
+
+#[test]
+fn load_claude_conversations_reads_sessions_and_hides_non_interactive_ones() {
+    let temp_dir = TestDir::new("claude-load");
+    let projects = temp_dir.path().join("projects");
+    let project = projects.join("-tmp-api");
+    fs::create_dir_all(project.join("session-a"))
+        .unwrap_or_else(|_| unreachable!("project dirs should create"));
+    fs::write(projects.join("stray-file"), "")
+        .unwrap_or_else(|_| unreachable!("stray file should write"));
+    fs::write(project.join("notes.txt"), "")
+        .unwrap_or_else(|_| unreachable!("non-session file should write"));
+    fs::write(
+        project.join("session-a.jsonl"),
+        concat!(
+            r#"{"type":"custom-title","customTitle":"api-fix"}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/tmp/api","timestamp":"2026-10-22T00:00:00Z","message":{"content":"fix   the\nbug"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap_or_else(|_| unreachable!("session should write"));
+    fs::write(
+        project.join("session-b.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/tmp/api","entrypoint":"sdk-cli","message":{"content":"automated"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap_or_else(|_| unreachable!("session should write"));
+    let renamed = format!(
+        "{}\n{}{}\n",
+        r#"{"type":"custom-title","customTitle":"old-name"}"#,
+        format!(
+            "{}\n",
+            r#"{"type":"user","cwd":"/tmp/web","timestamp":"2026-10-22T00:00:00Z","message":{"content":"padding"}}"#
+        )
+        .repeat(8_000),
+        r#"{"type":"custom-title","customTitle":"new-name"}"#,
+    );
+    fs::write(project.join("session-d.jsonl"), renamed)
+        .unwrap_or_else(|_| unreachable!("session should write"));
+    fs::write(project.join("session-c.jsonl"), "{\"type\":\"mode\"}\n")
+        .unwrap_or_else(|_| unreachable!("session should write"));
+
+    let visible = load_claude_conversations(&projects, false)
+        .unwrap_or_else(|_| unreachable!("sessions should load"));
+    assert_eq!(visible.len(), 2);
+    let renamed = visible
+        .iter()
+        .find(|conversation| conversation.id() == "session-d")
+        .unwrap_or_else(|| unreachable!("renamed session should load"));
+    assert_eq!(renamed.display_title, "new-name");
+    let session = visible
+        .iter()
+        .find(|conversation| conversation.id() == "session-a")
+        .unwrap_or_else(|| unreachable!("session should load"));
+    assert_eq!(session.agent, Agent::Claude);
+    assert_eq!(session.display_title, "api-fix");
+    assert_eq!(session.preview, "fix the bug");
+    assert_eq!(session.cwd, "/tmp/api");
+    assert_eq!(session.created_at_ms, 1_792_627_200_000);
+    assert!(session.updated_at_ms >= session.created_at_ms);
+    assert!(!session.is_subagent);
+
+    let all = load_claude_conversations(&projects, true)
+        .unwrap_or_else(|_| unreachable!("sessions should load"));
+    let mut ids = all.iter().map(Conversation::id).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["session-a", "session-b", "session-d"]);
+    assert!(all.iter().any(|conversation| conversation.is_subagent));
+
+    assert!(
+        load_claude_conversations(&temp_dir.path().join("missing"), false)
+            .unwrap_or_else(|_| unreachable!("missing projects dir should be empty"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn load_claude_conversations_reports_unreadable_paths() {
+    let temp_dir = TestDir::new("claude-load-errors");
+    let not_a_dir = temp_dir.path().join("file");
+    fs::write(&not_a_dir, "").unwrap_or_else(|_| unreachable!("file should write"));
+    let error = load_claude_conversations(&not_a_dir, false)
+        .err()
+        .unwrap_or_else(|| unreachable!("a file is not a projects directory"));
+    assert!(error.to_string().contains("failed to read"));
+
+    let projects = temp_dir.path().join("projects");
+    let project = projects.join("locked");
+    fs::create_dir_all(&project).unwrap_or_else(|_| unreachable!("project should create"));
+    let session = project.join("session.jsonl");
+    fs::write(&session, "{}\n").unwrap_or_else(|_| unreachable!("session should write"));
+    fs::set_permissions(&session, fs::Permissions::from_mode(0o000))
+        .unwrap_or_else(|_| unreachable!("permissions should update"));
+    let error = load_claude_conversations(&projects, false)
+        .err()
+        .unwrap_or_else(|| unreachable!("unreadable sessions should fail"));
+    assert!(error.to_string().contains("failed to open"));
+
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o000))
+        .unwrap_or_else(|_| unreachable!("permissions should update"));
+    let error = load_claude_conversations(&projects, false)
+        .err()
+        .unwrap_or_else(|| unreachable!("unreadable project dirs should fail"));
+    assert!(error.to_string().contains("failed to read"));
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|_| unreachable!("permissions should restore"));
+}
+
+#[test]
+fn agent_modes_filter_and_label_conversations() {
+    let mut app = App::new(
+        vec![
+            conversation("claude-1", "/tmp/api", "alpha", "preview", 30, 10),
+            codex_conversation("codex-1", "/tmp/api", "beta", "preview", 20, 10),
+        ],
+        "/tmp/api".to_string(),
+    );
+    assert_eq!(app.visible_ids(), vec!["claude-1".to_string()]);
+    let claude_screen = render_to_string(&app);
+    assert!(claude_screen.contains("Agent: Claude"));
+
+    app.focus = FocusTarget::Agent;
+    app.change_current_option_right();
+    assert_eq!(app.agent_mode, AgentMode::Codex);
+    assert_eq!(app.visible_ids(), vec!["codex-1".to_string()]);
+    let codex_screen = render_to_string(&app);
+    assert!(codex_screen.contains("Agent: Claude [Codex] All"));
+    assert!(codex_screen.contains("● Codex"));
+    assert!(codex_screen.contains("Agent: Codex"));
+
+    app.change_current_option_right();
+    assert_eq!(app.agent_mode, AgentMode::All);
+    assert_eq!(
+        app.visible_ids(),
+        vec!["claude-1".to_string(), "codex-1".to_string()]
+    );
+    assert!(render_to_string(&app).contains("Agent: All"));
+
+    app.change_current_option_left();
+    assert_eq!(app.agent_mode, AgentMode::Codex);
+
+    assert_eq!(AgentMode::All.tight_label(), "[A]");
+    assert_eq!(AgentMode::Codex.tight_label(), "[Cx]");
+    assert_eq!(AgentMode::All.label(), "Claude Codex [All]");
+}
+
+#[test]
+fn selected_rows_use_the_agent_highlight() {
+    use ratatui::style::{Color, Modifier, Style};
+
+    assert_eq!(
+        Agent::Claude.highlight_style(),
+        Style::default()
+            .bg(Color::Rgb(217, 119, 87))
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    );
+    assert_eq!(
+        Agent::Codex.highlight_style(),
+        Style::default().add_modifier(Modifier::REVERSED)
+    );
+
+    let app = App::new(
+        vec![conversation(
+            "claude-1", "/tmp/api", "alpha", "preview", 30, 10,
+        )],
+        "/tmp/api".to_string(),
+    );
+    let backend = TestBackend::new(140, 20);
+    let mut terminal =
+        Terminal::new(backend).unwrap_or_else(|_| unreachable!("test terminal should initialize"));
+    assert!(terminal.draw(|frame| render(frame, &app)).is_ok());
+    let buffer = terminal.backend().buffer();
+    let selected_row = (0..buffer.area.height)
+        .find(|&y| buffer[(0, y)].symbol() == "›")
+        .unwrap_or_else(|| unreachable!("selected row should render"));
+    assert_eq!(buffer[(5, selected_row)].bg, Color::Rgb(217, 119, 87));
+}
+
 fn render_to_string(app: &App) -> String {
     render_to_string_with_size(app, 140, 20)
 }
@@ -3452,5 +3790,139 @@ fn conversation(
         updated_at_ms,
         created_at_ms,
         is_subagent: false,
+        agent: Agent::Claude,
     }
+}
+
+fn codex_conversation(
+    id: &str,
+    cwd: &str,
+    title: &str,
+    preview: &str,
+    updated_at_ms: i64,
+    created_at_ms: i64,
+) -> Conversation {
+    Conversation {
+        agent: Agent::Codex,
+        ..conversation(id, cwd, title, preview, updated_at_ms, created_at_ms)
+    }
+}
+
+fn head_from(lines: &[&str]) -> SessionHead {
+    read_session_head(Cursor::new(lines.join("\n")))
+        .unwrap_or_else(|_| unreachable!("in-memory reads should succeed"))
+}
+
+#[test]
+fn reads_cwd_title_prompt_and_created_time() {
+    let head = head_from(&[
+        r#"{"type":"custom-title","customTitle":"my-title","sessionId":"s"}"#,
+        r#"{"type":"user","cwd":"/tmp/api","timestamp":"2026-10-22T00:59:23.579Z","message":{"content":"<local-command-stdout>done</local-command-stdout>"}}"#,
+        r#"{"type":"user","isSidechain":true,"message":{"content":"sidechain prompt"}}"#,
+        r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"Base directory for this skill"}]}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result"},{"type":"text","text":"  fix the bug  "}]}}"#,
+        r#"{"type":"user","message":{"content":"later prompt"}}"#,
+    ]);
+
+    assert_eq!(head.cwd.as_deref(), Some("/tmp/api"));
+    assert_eq!(head.custom_title.as_deref(), Some("my-title"));
+    assert_eq!(head.first_prompt.as_deref(), Some("fix the bug"));
+    assert_eq!(head.created_at_ms, Some(1_792_630_763_579));
+    assert!(!head.is_non_interactive);
+}
+
+#[test]
+fn skips_truncated_and_unrelated_lines() {
+    let head = head_from(&[
+        r#"{"type":"mode","mode":"normal"}"#,
+        "not json",
+        r#"{"type":"user","cwd":"  ","entrypoint":"sdk-cli","timestamp":"bogus","message":{"content":[]}}"#,
+        r#"{"type":"assistant","cwd":"/tmp/web","message":{"content":[{"type":"text","text":"reply"}]}}"#,
+        r#"{"type":"user","message":{"content":"   "}}"#,
+        r#"{"type":"user","message":{"content":"<command-name> </command-name><command-args>"}}"#,
+        r#"{"type":"user","message":{}}"#,
+        r#"{"type":"user","cwd":"/tmp/web"#,
+    ]);
+
+    assert_eq!(head.cwd.as_deref(), Some("/tmp/web"));
+    assert_eq!(head.custom_title, None);
+    assert_eq!(head.first_prompt, None);
+    assert_eq!(head.created_at_ms, None);
+    assert!(head.is_non_interactive);
+}
+
+#[test]
+fn default_projects_path_resolves_inside_home() {
+    assert_eq!(
+        default_claude_projects_path_from_home(Some(PathBuf::from("/home/me"))),
+        PathBuf::from("/home/me/.claude/projects")
+    );
+    assert_eq!(
+        default_claude_projects_path_from_home(None),
+        PathBuf::from("~/.claude/projects")
+    );
+    assert!(default_claude_projects_path().ends_with(".claude/projects"));
+}
+
+#[test]
+fn tail_lines_replace_the_title_only_with_complete_custom_title_records() {
+    let mut head = SessionHead::default();
+    head.absorb_tail_line(br#"{"type":"user","message":{"content":"no title here"}}"#);
+    head.absorb_tail_line(br#"le":"cut-off","type":"custom-title"}"#);
+    assert_eq!(head.custom_title, None);
+
+    head.absorb_tail_line(br#"{"type":"custom-title","customTitle":"renamed"}"#);
+    assert_eq!(head.custom_title.as_deref(), Some("renamed"));
+}
+
+#[test]
+fn slash_commands_become_the_prompt_instead_of_skill_instructions() {
+    let head = head_from(&[
+        r#"{"type":"user","cwd":"/tmp/api","message":{"content":"<command-message>handle-pr-feedback</command-message>\n<command-name>/handle-pr-feedback</command-name>\n<command-args>https://github.com/o/r/pull/1</command-args>"}}"#,
+        r#"{"type":"user","isMeta":true,"message":{"content":[{"type":"text","text":"Base directory for this skill"}]}}"#,
+    ]);
+    assert_eq!(
+        head.first_prompt.as_deref(),
+        Some("/handle-pr-feedback https://github.com/o/r/pull/1")
+    );
+
+    let head = head_from(&[
+        r#"{"type":"user","message":{"content":"<command-name>/clear</command-name><command-args></command-args>"}}"#,
+    ]);
+    assert_eq!(head.first_prompt.as_deref(), Some("/clear"));
+}
+
+#[test]
+fn generated_titles_name_sessions_without_a_custom_title() {
+    let mut head = head_from(&[
+        r#"{"type":"ai-title","aiTitle":"First guess"}"#,
+        r#"{"type":"ai-title","aiTitle":"Better guess"}"#,
+    ]);
+    assert_eq!(head.title(), Some("Better guess"));
+
+    head.absorb_tail_line(br#"{"type":"ai-title","aiTitle":"Latest guess"}"#);
+    assert_eq!(head.title(), Some("Latest guess"));
+
+    head.absorb_tail_line(br#"{"type":"custom-title","customTitle":"chosen"}"#);
+    assert_eq!(head.title(), Some("chosen"));
+}
+
+#[test]
+fn shell_quote_leaves_plain_values_and_quotes_the_rest() {
+    assert_eq!(super::shell_quote("/tmp/api-1.x"), "/tmp/api-1.x");
+    assert_eq!(super::shell_quote(""), "''");
+    assert_eq!(super::shell_quote("/tmp/my dir"), "'/tmp/my dir'");
+    assert_eq!(super::shell_quote("it's"), r"'it'\''s'");
+}
+
+#[test]
+fn missing_codex_database_yields_no_conversations_without_creating_it() {
+    let temp_dir = TestDir::new("missing-codex-db");
+    let db_path = temp_dir.path().join("state.sqlite");
+
+    let conversations = load_conversations(&db_path, &temp_dir.path().join("missing.jsonl"))
+        .unwrap_or_else(|_| unreachable!("a missing database should be empty"));
+
+    assert!(conversations.is_empty());
+    assert!(!db_path.exists());
 }

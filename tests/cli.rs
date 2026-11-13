@@ -20,7 +20,7 @@ mod tests {
         assert!(output.status.success());
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Global Codex conversation picker"));
+        assert!(stdout.contains("Global Claude Code and Codex conversation picker"));
     }
 
     #[test]
@@ -35,6 +35,10 @@ mod tests {
                 &db_path.display().to_string(),
                 "--session-index-path",
                 &temp_dir.path().join("missing.jsonl").display().to_string(),
+                "--claude-projects-path",
+                &temp_dir.path().join("missing-claude").display().to_string(),
+                "--agent",
+                "codex",
                 "--dry-run",
             ])
             .output();
@@ -45,7 +49,7 @@ mod tests {
         assert!(!output.status.success());
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("no Codex conversations found"));
+        assert!(stderr.contains("no Claude or Codex conversations found"));
     }
 
     #[test]
@@ -66,6 +70,10 @@ mod tests {
                 &db_path.display().to_string(),
                 "--session-index-path",
                 &temp_dir.path().join("missing.jsonl").display().to_string(),
+                "--claude-projects-path",
+                &temp_dir.path().join("missing-claude").display().to_string(),
+                "--agent",
+                "codex",
                 "--dry-run",
                 "--codex-bin",
                 &codex_path.display().to_string(),
@@ -114,6 +122,10 @@ mod tests {
                 &db_path.display().to_string(),
                 "--session-index-path",
                 &temp_dir.path().join("missing.jsonl").display().to_string(),
+                "--claude-projects-path",
+                &temp_dir.path().join("missing-claude").display().to_string(),
+                "--agent",
+                "codex",
                 "--codex-bin",
                 &codex_path.display().to_string(),
             ]);
@@ -140,6 +152,81 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn claude_sessions_resume_from_their_directory() {
+        for dry_run in [true, false] {
+            let temp_dir = TestDir::new("claude-resume");
+            let db_path = temp_dir.path().join("state.sqlite");
+            let projects_path = temp_dir.path().join("projects");
+            let claude_path = temp_dir.path().join("fake-claude.sh");
+            let log_path = temp_dir.path().join("resume.log");
+            create_empty_threads_db(&db_path);
+            write_claude_session(&projects_path, temp_dir.path(), "session-1");
+            write_executable(
+                &claude_path,
+                &format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > '{}'\n",
+                    log_path.display()
+                ),
+            );
+
+            let mut command = Command::new(cdx_bin());
+            command.env("CDX_TEST_FAKE_TERMINAL", "1").args([
+                "--db-path",
+                &db_path.display().to_string(),
+                "--session-index-path",
+                &temp_dir.path().join("missing.jsonl").display().to_string(),
+                "--claude-projects-path",
+                &projects_path.display().to_string(),
+                "--claude-bin",
+                &claude_path.display().to_string(),
+            ]);
+            if dry_run {
+                command.arg("--dry-run");
+            }
+            let output = command
+                .output()
+                .unwrap_or_else(|_| unreachable!("claude resume command should finish"));
+
+            assert!(output.status.success(), "{output:?}");
+
+            if dry_run {
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    format!(
+                        "cd {} && {} --resume session-1\n",
+                        temp_dir.path().display(),
+                        claude_path.display()
+                    )
+                );
+                assert!(!log_path.exists());
+            } else {
+                let log = fs::read_to_string(&log_path)
+                    .unwrap_or_else(|_| unreachable!("resume log should be written"));
+                let canonical_cwd = fs::canonicalize(temp_dir.path())
+                    .unwrap_or_else(|_| unreachable!("temp cwd should canonicalize"));
+                assert_eq!(
+                    log,
+                    format!("{}\n--resume\nsession-1\n", canonical_cwd.display())
+                );
+            }
+        }
+    }
+
+    fn write_claude_session(projects_path: &Path, cwd: &Path, session_id: &str) {
+        let project_dir = projects_path.join("project");
+        fs::create_dir_all(&project_dir)
+            .unwrap_or_else(|_| unreachable!("project dir should create"));
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\",\"message\":{{\"content\":\"hello\"}}}}\n",
+                cwd.display()
+            ),
+        )
+        .unwrap_or_else(|_| unreachable!("session should write"));
     }
 
     fn cdx_bin() -> &'static str {

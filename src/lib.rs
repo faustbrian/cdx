@@ -1,9 +1,9 @@
-//! Terminal UI for browsing and resuming local Codex conversations.
+//! Terminal UI for browsing and resuming local Claude Code and Codex conversations.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(not(test))]
@@ -35,7 +35,10 @@ use ratatui::widgets::{
 use rusqlite::Connection;
 use serde::Deserialize;
 
+mod claude;
 mod coverage_excluded;
+
+pub use claude::{default_claude_projects_path, load_claude_conversations};
 
 use coverage_excluded::{
     deduplicate_conversations, display_title, finish_draw, normalize_search_text, preview_text,
@@ -50,6 +53,10 @@ const CONTROLS_SAFE_MARGIN: u16 = 2;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const TABLE_HIGHLIGHT_WIDTH: u16 = 2;
 const TABLE_SCROLLBAR_WIDTH: u16 = 1;
+const AGENT_COLUMN_WIDTH: u16 = 8;
+/// Claude's brand orange (#D97757), used to mark Claude rows.
+const CLAUDE_ORANGE: Color = Color::Rgb(217, 119, 87);
+const CODEX_BLUE: Color = Color::Rgb(122, 162, 247);
 const CHILD_THREAD_IDS_QUERY: &str =
     "select coalesce(json_group_array(child_thread_id), '[]') from thread_spawn_edges";
 /// The input polling interval used by the interactive terminal picker.
@@ -62,14 +69,117 @@ pub struct RunConfig {
     pub db_path: Option<PathBuf>,
     /// Optional override for the Codex session index JSONL file.
     pub session_index_path: Option<PathBuf>,
+    /// Optional override for the Claude Code projects directory.
+    pub claude_projects_path: Option<PathBuf>,
     /// The binary used for `codex resume`.
     pub codex_bin: String,
+    /// The binary used for `claude --resume`.
+    pub claude_bin: String,
     /// Prints the resume command instead of executing it.
     pub dry_run: bool,
     /// Allows Codex to use its shared daemon instead of passing `--no-daemon`.
     pub allow_daemon: bool,
     /// Includes spawned subagent conversations in the picker.
     pub include_subagents: bool,
+    /// The agent whose conversations are shown first.
+    pub agent_mode: AgentMode,
+}
+
+/// The coding agent that owns a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    /// A Claude Code session from `~/.claude/projects`.
+    Claude,
+    /// A Codex thread from the Codex `SQLite` state.
+    Codex,
+}
+
+impl Agent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Claude => CLAUDE_ORANGE,
+            Self::Codex => CODEX_BLUE,
+        }
+    }
+
+    fn highlight_style(self) -> Style {
+        match self {
+            Self::Claude => Style::default()
+                .bg(CLAUDE_ORANGE)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            Self::Codex => Style::default().add_modifier(Modifier::REVERSED),
+        }
+    }
+}
+
+/// Which agents' conversations the picker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    /// Only Claude Code sessions.
+    #[default]
+    Claude,
+    /// Only Codex threads.
+    Codex,
+    /// Conversations from every agent.
+    All,
+}
+
+impl AgentMode {
+    fn next(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::All,
+            Self::All => Self::Claude,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Claude => Self::All,
+            Self::Codex => Self::Claude,
+            Self::All => Self::Codex,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "[Claude] Codex All",
+            Self::Codex => "Claude [Codex] All",
+            Self::All => "Claude Codex [All]",
+        }
+    }
+
+    fn tight_label(self) -> &'static str {
+        match self {
+            Self::Claude => "[Cl]",
+            Self::Codex => "[Cx]",
+            Self::All => "[A]",
+        }
+    }
+
+    fn status_label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::All => "All",
+        }
+    }
+
+    fn matches(self, agent: Agent) -> bool {
+        match self {
+            Self::Claude => agent == Agent::Claude,
+            Self::Codex => agent == Agent::Codex,
+            Self::All => true,
+        }
+    }
 }
 
 /// A local Codex conversation row rendered in the picker.
@@ -83,6 +193,7 @@ pub struct Conversation {
     updated_at_ms: i64,
     created_at_ms: i64,
     is_subagent: bool,
+    agent: Agent,
 }
 
 #[derive(Debug)]
@@ -193,6 +304,7 @@ impl SortMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusTarget {
     Search,
+    Agent,
     Filter,
     Subagents,
     Sort,
@@ -201,7 +313,8 @@ enum FocusTarget {
 impl FocusTarget {
     fn next(self) -> Self {
         match self {
-            Self::Search => Self::Filter,
+            Self::Search => Self::Agent,
+            Self::Agent => Self::Filter,
             Self::Filter => Self::Subagents,
             Self::Subagents => Self::Sort,
             Self::Sort => Self::Search,
@@ -211,7 +324,8 @@ impl FocusTarget {
     fn previous(self) -> Self {
         match self {
             Self::Search => Self::Sort,
-            Self::Filter => Self::Search,
+            Self::Agent => Self::Search,
+            Self::Filter => Self::Agent,
             Self::Subagents => Self::Filter,
             Self::Sort => Self::Subagents,
         }
@@ -293,21 +407,23 @@ pub struct App {
     column_preset: ColumnPreset,
     row_mode: RowMode,
     subagent_mode: SubagentMode,
+    agent_mode: AgentMode,
 }
 
 impl App {
     /// Creates a picker state for the provided conversations and current directory.
     #[must_use]
     pub fn new(conversations: Vec<Conversation>, current_cwd: String) -> Self {
-        Self::new_with_options(conversations, current_cwd, false)
+        Self::new_with_options(conversations, current_cwd, false, AgentMode::default())
     }
 
-    /// Creates a picker state with an explicit initial subagent visibility mode.
+    /// Creates a picker state with explicit initial subagent and agent modes.
     #[must_use]
     pub fn new_with_options(
         conversations: Vec<Conversation>,
         current_cwd: String,
         include_subagents: bool,
+        agent_mode: AgentMode,
     ) -> Self {
         let mut app = Self {
             conversations,
@@ -325,6 +441,7 @@ impl App {
             } else {
                 SubagentMode::Hide
             },
+            agent_mode,
         };
         app.refresh_visible();
         app
@@ -390,7 +507,7 @@ impl App {
             SubagentMode::Show => true,
         };
 
-        if !directory_matches {
+        if !directory_matches || !self.agent_mode.matches(conversation.agent) {
             return false;
         }
 
@@ -501,6 +618,10 @@ impl App {
     fn change_current_option_right(&mut self) {
         match self.focus {
             FocusTarget::Search => {}
+            FocusTarget::Agent => {
+                self.agent_mode = self.agent_mode.next();
+                self.refresh_visible();
+            }
             FocusTarget::Filter => {
                 self.filter_mode = self.filter_mode.next();
                 self.refresh_visible();
@@ -516,6 +637,10 @@ impl App {
     fn change_current_option_left(&mut self) {
         match self.focus {
             FocusTarget::Search => {}
+            FocusTarget::Agent => {
+                self.agent_mode = self.agent_mode.previous();
+                self.refresh_visible();
+            }
             FocusTarget::Filter => {
                 self.filter_mode = self.filter_mode.previous();
                 self.refresh_visible();
@@ -576,6 +701,12 @@ pub fn load_conversations_with_options(
 }
 
 fn load_all_conversations(db_path: &Path, session_index_path: &Path) -> Result<Vec<Conversation>> {
+    // Opening a missing database would create an empty file in Codex's
+    // directory and then fail, so machines without Codex skip it instead.
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+
     let connection = match Connection::open(db_path) {
         Ok(connection) => connection,
         Err(error) => {
@@ -777,6 +908,7 @@ impl Conversation {
             updated_at_ms,
             created_at_ms: row.created_at_ms.max(updated_at_ms),
             is_subagent,
+            agent: Agent::Codex,
         })
     }
 }
@@ -847,15 +979,26 @@ fn effective_updated_at_ms(recency_at_ms: i64, updated_at_ms: i64) -> Option<i64
 /// directory, running the picker, or resuming the selected conversation fails.
 pub fn run_default(config: RunConfig) -> Result<()> {
     let allow_daemon = config.allow_daemon;
+    let claude_projects_path = config
+        .claude_projects_path
+        .clone()
+        .unwrap_or_else(default_claude_projects_path);
     run_with(
         config,
         |db_path, session_index_path| {
-            load_conversations_with_options(db_path, session_index_path, true)
+            let mut conversations = load_claude_conversations(&claude_projects_path, true)?;
+            conversations.extend(load_conversations_with_options(
+                db_path,
+                session_index_path,
+                true,
+            )?);
+            Ok(conversations)
         },
         env::current_dir,
         select_conversation,
-        |bin, id, cwd, dry_run| {
-            resume_conversation_with_daemon(bin, id, cwd, dry_run, allow_daemon)
+        |agent, bin, id, cwd, dry_run| match agent {
+            Agent::Claude => resume_claude_conversation(bin, id, cwd, dry_run),
+            Agent::Codex => resume_conversation_with_daemon(bin, id, cwd, dry_run, allow_daemon),
         },
     )
 }
@@ -878,7 +1021,7 @@ where
     FLoad: FnMut(&Path, &Path) -> Result<Vec<Conversation>>,
     FCwd: FnMut() -> io::Result<PathBuf>,
     FSelect: FnMut(&mut App) -> Result<Conversation>,
-    FResume: FnMut(&str, &str, &str, bool) -> Result<()>,
+    FResume: FnMut(Agent, &str, &str, &str, bool) -> Result<()>,
 {
     run_with_impl(
         config,
@@ -894,7 +1037,7 @@ fn run_with_impl(
     load_conversations: &mut dyn FnMut(&Path, &Path) -> Result<Vec<Conversation>>,
     current_dir: &mut dyn FnMut() -> io::Result<PathBuf>,
     select_conversation: &mut dyn FnMut(&mut App) -> Result<Conversation>,
-    resume_conversation: &mut dyn FnMut(&str, &str, &str, bool) -> Result<()>,
+    resume_conversation: &mut ResumeFn<'_>,
 ) -> Result<()> {
     let db_path = config.db_path.unwrap_or_else(default_state_db_path);
     let session_index_path = config
@@ -907,18 +1050,31 @@ fn run_with_impl(
         .to_string();
 
     if conversations.is_empty() {
-        bail!("no Codex conversations found");
+        bail!("no Claude or Codex conversations found");
     }
 
-    let mut app = App::new_with_options(conversations, current_cwd, config.include_subagents);
+    let mut app = App::new_with_options(
+        conversations,
+        current_cwd,
+        config.include_subagents,
+        config.agent_mode,
+    );
     let selected = select_conversation(&mut app)?;
+    let bin = match selected.agent {
+        Agent::Claude => &config.claude_bin,
+        Agent::Codex => &config.codex_bin,
+    };
     resume_conversation(
-        &config.codex_bin,
+        selected.agent,
+        bin,
         selected.id(),
         selected.cwd.as_str(),
         config.dry_run,
     )
 }
+
+/// Resumes `(agent, bin, conversation id, cwd, dry run)`.
+type ResumeFn<'a> = dyn FnMut(Agent, &str, &str, &str, bool) -> Result<()> + 'a;
 
 /// Selects a conversation using the default terminal session implementation.
 ///
@@ -1182,6 +1338,59 @@ fn resume_subprocess_conversation(
     }
 }
 
+/// Resumes a Claude Code session with `claude --resume` from its directory.
+///
+/// Claude Code looks sessions up by the working directory they were created
+/// in, so the subprocess must start there.
+///
+/// # Errors
+///
+/// Returns an error when writing dry-run output, spawning the subprocess, or
+/// the subprocess exits unsuccessfully.
+pub fn resume_claude_conversation(
+    claude_bin: &str,
+    session_id: &str,
+    cwd: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let command_text = format!(
+        "cd {} && {} --resume {}",
+        shell_quote(cwd),
+        shell_quote(claude_bin),
+        shell_quote(session_id)
+    );
+    if dry_run {
+        let mut stdout = io::stdout();
+        return writeln!(stdout, "{command_text}").context("failed to write dry-run output");
+    }
+
+    let status = Command::new(claude_bin)
+        .args(["--resume", session_id])
+        .current_dir(cwd)
+        .status()
+        .with_context(|| format!("failed to execute `{command_text}`"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("`{command_text}` exited with {status}");
+    }
+}
+
+/// Quotes a value so the printed dry-run command can be pasted into a shell.
+fn shell_quote(value: &str) -> String {
+    let is_plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "/._-+:@%=,".contains(ch));
+
+    if is_plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
 #[cfg(not(test))]
 fn debug_fake_terminal_enabled() -> bool {
     cfg!(debug_assertions) && env::var_os("CDX_TEST_FAKE_TERMINAL").is_some()
@@ -1227,7 +1436,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect) {
-    let title = Paragraph::new("Resume a previous session").style(
+    let title = Paragraph::new("Resume a previous Claude or Codex session").style(
         Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
@@ -1261,21 +1470,19 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let search = Paragraph::new(search_value).style(search_style);
     frame.render_widget(search, layout[0]);
 
-    let filter_style = if app.focus == FocusTarget::Filter {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let styles = ControlStyles {
+        agent: control_style(app, FocusTarget::Agent),
+        filter: control_style(app, FocusTarget::Filter),
+        subagent: control_style(app, FocusTarget::Subagents),
+        sort: control_style(app, FocusTarget::Sort),
     };
-    let sort_style = if app.focus == FocusTarget::Sort {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let subagent_style = if app.focus == FocusTarget::Subagents {
+
+    let controls = Paragraph::new(controls_variant.line(app, styles)).alignment(Alignment::Right);
+    frame.render_widget(controls, layout[1]);
+}
+
+fn control_style(app: &App, target: FocusTarget) -> Style {
+    let style = if app.focus == target {
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
@@ -1283,10 +1490,19 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let controls =
-        Paragraph::new(controls_variant.line(app, filter_style, subagent_style, sort_style))
-            .alignment(Alignment::Right);
-    frame.render_widget(controls, layout[1]);
+    if target == FocusTarget::Agent && app.agent_mode == AgentMode::Claude {
+        style.fg(CLAUDE_ORANGE)
+    } else {
+        style
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlStyles {
+    agent: Style,
+    filter: Style,
+    subagent: Style,
+    sort: Style,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1301,6 +1517,9 @@ impl ControlsVariant {
     fn width(self, app: &App) -> u16 {
         match self {
             Self::Full => controls_width(&[
+                "Agent: ",
+                app.agent_mode.label(),
+                "   ",
                 "Filter: ",
                 app.filter_mode.label(),
                 "   ",
@@ -1311,6 +1530,9 @@ impl ControlsVariant {
                 app.sort_mode.label(),
             ]),
             Self::Compact => controls_width(&[
+                "A: ",
+                app.agent_mode.status_label(),
+                "   ",
                 "F: ",
                 compact_filter_label(app.filter_mode),
                 "   ",
@@ -1321,6 +1543,9 @@ impl ControlsVariant {
                 compact_sort_label(app.sort_mode),
             ]),
             Self::Tight => controls_width(&[
+                "A:",
+                app.agent_mode.tight_label(),
+                " ",
                 "F:",
                 tight_filter_label(app.filter_mode),
                 " ",
@@ -1331,6 +1556,9 @@ impl ControlsVariant {
                 tight_sort_label(app.sort_mode),
             ]),
             Self::Minimal => controls_width(&[
+                "A",
+                app.agent_mode.tight_label(),
+                " ",
                 "F",
                 tight_filter_label(app.filter_mode),
                 " ",
@@ -1343,17 +1571,20 @@ impl ControlsVariant {
         }
     }
 
-    fn line(
-        self,
-        app: &App,
-        filter_style: Style,
-        subagent_style: Style,
-        sort_style: Style,
-    ) -> Line<'static> {
+    fn line(self, app: &App, styles: ControlStyles) -> Line<'static> {
         let muted = Style::default().fg(Color::DarkGray);
+        let ControlStyles {
+            agent: agent_style,
+            filter: filter_style,
+            subagent: subagent_style,
+            sort: sort_style,
+        } = styles;
 
         match self {
             Self::Full => Line::from(vec![
+                Span::styled("Agent: ", muted),
+                Span::styled(app.agent_mode.label(), agent_style),
+                Span::raw("   "),
                 Span::styled("Filter: ", muted),
                 Span::styled(app.filter_mode.label(), filter_style),
                 Span::raw("   "),
@@ -1364,6 +1595,9 @@ impl ControlsVariant {
                 Span::styled(app.sort_mode.label(), sort_style),
             ]),
             Self::Compact => Line::from(vec![
+                Span::styled("A: ", muted),
+                Span::styled(app.agent_mode.status_label(), agent_style),
+                Span::raw("   "),
                 Span::styled("F: ", muted),
                 Span::styled(compact_filter_label(app.filter_mode), filter_style),
                 Span::raw("   "),
@@ -1374,6 +1608,9 @@ impl ControlsVariant {
                 Span::styled(compact_sort_label(app.sort_mode), sort_style),
             ]),
             Self::Tight => Line::from(vec![
+                Span::styled("A:", muted),
+                Span::styled(app.agent_mode.tight_label(), agent_style),
+                Span::raw(" "),
                 Span::styled("F:", muted),
                 Span::styled(tight_filter_label(app.filter_mode), filter_style),
                 Span::raw(" "),
@@ -1384,6 +1621,9 @@ impl ControlsVariant {
                 Span::styled(tight_sort_label(app.sort_mode), sort_style),
             ]),
             Self::Minimal => Line::from(vec![
+                Span::styled("A", muted),
+                Span::styled(app.agent_mode.tight_label(), agent_style),
+                Span::raw(" "),
                 Span::styled("F", muted),
                 Span::styled(tight_filter_label(app.filter_mode), filter_style),
                 Span::raw(" "),
@@ -1496,11 +1736,14 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let (header, widths) = table_columns(app.column_preset);
+    let selected_agent = app
+        .selected_conversation()
+        .map_or(Agent::Codex, |conversation| conversation.agent);
 
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(TABLE_COLUMN_SPACING)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(selected_agent.highlight_style())
         .highlight_symbol("› ");
 
     let mut state = TableState::default().with_selected(Some(app.selected));
@@ -1519,12 +1762,14 @@ fn table_columns(column_preset: ColumnPreset) -> (Row<'static>, Vec<Constraint>)
     match column_preset {
         ColumnPreset::Core => (
             Row::new(vec![
+                Cell::from("Agent"),
                 Cell::from("Directory"),
                 Cell::from("Conversation"),
                 Cell::from("Excerpt"),
             ])
             .style(Style::default().fg(Color::DarkGray)),
             vec![
+                Constraint::Length(AGENT_COLUMN_WIDTH),
                 Constraint::Length(28),
                 Constraint::Length(26),
                 Constraint::Min(36),
@@ -1532,6 +1777,7 @@ fn table_columns(column_preset: ColumnPreset) -> (Row<'static>, Vec<Constraint>)
         ),
         ColumnPreset::Full => (
             Row::new(vec![
+                Cell::from("Agent"),
                 Cell::from("Age"),
                 Cell::from("Updated"),
                 Cell::from("Directory"),
@@ -1540,6 +1786,7 @@ fn table_columns(column_preset: ColumnPreset) -> (Row<'static>, Vec<Constraint>)
             ])
             .style(Style::default().fg(Color::DarkGray)),
             vec![
+                Constraint::Length(AGENT_COLUMN_WIDTH),
                 Constraint::Length(9),
                 Constraint::Length(16),
                 Constraint::Length(24),
@@ -1594,13 +1841,22 @@ fn table_row(
         ]),
     };
 
+    let agent = conversation.agent;
+    let agent_cell = Cell::from(format!("● {}", agent.label())).style(
+        Style::default()
+            .fg(agent.color())
+            .add_modifier(Modifier::BOLD),
+    );
+
     let row = match column_preset {
         ColumnPreset::Core => Row::new(vec![
+            agent_cell,
             Cell::from(dir).style(Style::default().fg(Color::Gray)),
             title_cell,
             excerpt_cell,
         ]),
         ColumnPreset::Full => Row::new(vec![
+            agent_cell,
             Cell::from(age).style(bucket.style()),
             Cell::from(updated).style(bucket.style()),
             Cell::from(dir).style(Style::default().fg(Color::Gray)),
@@ -1664,6 +1920,11 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(format!("  {position}/{total}")),
         Span::raw("  "),
         Span::styled(
+            format!("Agent: {}", app.agent_mode.status_label()),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::raw("  "),
+        Span::styled(
             format!("Cols: {}", app.column_preset.label()),
             Style::default().fg(Color::DarkGray),
         ),
@@ -1690,7 +1951,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     let footer = Paragraph::new(vec![
-        Line::from("enter resume   esc exit   ctrl+c quit   tab focus search/filter/threads/sort   ←/→ or space change option"),
+        Line::from("enter resume   esc exit   ctrl+c quit   tab focus search/agent/filter/threads/sort   ←/→ or space change option"),
         Line::from("type search   backspace delete   ctrl+u clear   ctrl+v columns   ctrl+o view   ↑/↓ browse"),
     ])
     .style(Style::default().fg(Color::DarkGray));
